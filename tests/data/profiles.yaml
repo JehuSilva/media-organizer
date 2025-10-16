@@ -1,0 +1,4 @@
+profiles:
+  - name: eventos
+    template: "{year}/{month:02d}/{evento}"
+    description: "Agrupa por año/mes y evento."

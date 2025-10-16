@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "media-organizer"
+version = "0.1.0"
+description = "Automatic media organizer for photos and videos with configurable templates."
+authors = [
+  { name = "Media Organizer Team" }
+]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "typer[all]>=0.9,<1.0",
+  "Pillow==10.1.0",
+  "pillow-heif==0.14.0",
+  "python-dateutil>=2.8",
+  "pydantic>=2.5",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4",
+  "pytest-cov>=4.1",
+]
+
+[project.scripts]
+media-organizer = "media_organizer.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
