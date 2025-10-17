@@ -65,6 +65,9 @@ def available_placeholders() -> set[str]:
         "camera_model",
         "month_name",
         "month_name_short",
+        "category",
+        "category_label",
+        "category_slug",
     }
 
 
@@ -83,6 +86,9 @@ def build_context(metadata: MediaMetadata, extra: Optional[dict[str, str]] = Non
         "camera_model": _slug(metadata.camera_model) if metadata.camera_model else "unknown",
         "month_name": MONTH_NAMES_ES[dt.month],
         "month_name_short": MONTH_NAMES_ES_SHORT[dt.month],
+        "category": metadata.category.folder_name(),
+        "category_label": metadata.category.label(),
+        "category_slug": _slug(metadata.category.label()),
     }
     if extra:
         context.update(extra)

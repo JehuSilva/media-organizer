@@ -121,13 +121,21 @@ def _render_summary(summary: OrganizeSummary) -> None:
     table.add_column("Archivo origen", style="cyan", no_wrap=True)
     table.add_column("Destino", style="green")
     table.add_column("Estado", style="magenta")
+    table.add_column("Categoría", style="yellow")
     table.add_column("Mensaje", style="white")
 
     for result in summary.results:
+        category_label = "-"
+        if result.category is not None:
+            try:
+                category_label = result.category.label()
+            except AttributeError:
+                category_label = str(result.category)
         table.add_row(
             str(result.source),
             str(result.destination),
             result.status,
+            category_label,
             result.message or "",
         )
 
@@ -154,3 +162,16 @@ def _render_summary(summary: OrganizeSummary) -> None:
 
     summary_table.add_row("total", str(total), "100.0%" if total else "0.0%")
     console.print(summary_table)
+
+    category_counts = summary.category_counts()
+    if category_counts:
+        category_table = Table(title="Resumen por categoría")
+        category_table.add_column("Categoría", style="yellow")
+        category_table.add_column("Cantidad", style="cyan", justify="right")
+        category_table.add_column("Porcentaje", style="white", justify="right")
+
+        for label, value in category_counts.items():
+            percentage = f"{(value / total * 100):.1f}%" if total else "0.0%"
+            category_table.add_row(label, str(value), percentage)
+        category_table.add_row("total", str(total), "100.0%" if total else "0.0%")
+        console.print(category_table)

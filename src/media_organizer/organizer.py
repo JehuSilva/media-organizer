@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 from .config import OrganizerConfig, TemplateProfile
-from .metadata import MediaMetadata, extract_metadata
+from .metadata import MediaCategory, MediaMetadata, extract_metadata
 from .templates import render_template
 
 logger = logging.getLogger(__name__)
@@ -23,6 +23,7 @@ class FileResult:
     destination: Path
     status: str
     message: Optional[str] = None
+    category: Optional[MediaCategory] = None
 
 
 @dataclass
@@ -60,6 +61,15 @@ class OrganizeSummary:
     def status_counts(self) -> Counter[str]:
         return Counter(item.status for item in self.results)
 
+    def category_counts(self) -> Counter[str]:
+        labels: list[str] = []
+        for item in self.results:
+            if isinstance(item.category, MediaCategory):
+                labels.append(item.category.label())
+            elif isinstance(item.category, str):
+                labels.append(item.category)
+        return Counter(labels)
+
     def add(self, result: FileResult) -> None:
         self.results.append(result)
 
@@ -77,6 +87,7 @@ class MediaOrganizer:
     def organize(self, files: Iterable[Path]) -> OrganizeSummary:
         summary = OrganizeSummary()
         for file_path in files:
+            metadata: Optional[MediaMetadata] = None
             try:
                 metadata = extract_metadata(file_path)
                 destination = self._resolve_destination(metadata)
@@ -88,16 +99,18 @@ class MediaOrganizer:
                     destination=file_path,
                     status="failed",
                     message=str(exc),
+                    category=metadata.category if metadata else None,
                 )
             summary.add(result)
         return summary
 
     def _resolve_destination(self, metadata: MediaMetadata) -> Path:
+        base_dir = self._category_root(metadata)
         if metadata.has_reliable_timestamp:
             relative = render_template(metadata, self.template, self.config.extra)
-            destination_dir = (self.config.destination / relative).resolve()
+            destination_dir = (base_dir / relative).resolve()
         else:
-            destination_dir = (self.config.destination / "unknown_date").resolve()
+            destination_dir = (base_dir / "unknown_date").resolve()
             logger.warning(
                 "No se encontró fecha de captura confiable para %s; se moverá a %s",
                 metadata.source_path,
@@ -114,6 +127,9 @@ class MediaOrganizer:
             counter += 1
         return candidate
 
+    def _category_root(self, metadata: MediaMetadata) -> Path:
+        return (self.config.destination / metadata.category.folder_name()).resolve()
+
     def _apply_action(self, metadata: MediaMetadata, destination: Path) -> FileResult:
         source = metadata.source_path
         status = "skipped"
@@ -123,7 +139,13 @@ class MediaOrganizer:
             status = "dry-run"
             message = "Se omitió el movimiento por estar en modo dry-run."
             logger.info("[dry-run] %s -> %s", source, destination)
-            return FileResult(source=source, destination=destination, status=status, message=message)
+            return FileResult(
+                source=source,
+                destination=destination,
+                status=status,
+                message=message,
+                category=metadata.category,
+            )
 
         action = self.config.action
         try:
@@ -144,7 +166,13 @@ class MediaOrganizer:
             message = str(exc)
             logger.error("Error al aplicar la acción sobre %s: %s", source, exc)
 
-        return FileResult(source=source, destination=destination, status=status, message=message)
+        return FileResult(
+            source=source,
+            destination=destination,
+            status=status,
+            message=message,
+            category=metadata.category,
+        )
 
     @staticmethod
     def _create_link(source: Path, destination: Path) -> None:
