@@ -5,12 +5,14 @@ from __future__ import annotations
 import enum
 import json
 import logging
+import re
+import struct
 import subprocess
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import BinaryIO, Callable, Optional, Sequence
 from xml.etree import ElementTree as ET
 
 from dateutil import parser as date_parser
@@ -63,6 +65,8 @@ class TimestampSource(enum.Enum):
     METADATA = "metadata"
     FILE_CREATION = "file_creation"
     FILE_MODIFICATION = "file_modification"
+    FILENAME = "filename"
+    CONTAINER_METADATA = "container_metadata"
     UNKNOWN = "unknown"
 
 
@@ -89,7 +93,10 @@ class MediaMetadata:
 
     @property
     def has_reliable_timestamp(self) -> bool:
-        return self.timestamp_source in {TimestampSource.METADATA, TimestampSource.FILE_CREATION}
+        return self.timestamp_source not in {
+            TimestampSource.UNKNOWN,
+            TimestampSource.FILE_MODIFICATION,
+        }
 
 
 IMAGE_EXTENSIONS = {
@@ -151,6 +158,31 @@ DOCUMENT_EXTENSIONS = {
     ".odp",
 }
 
+QUICKTIME_EPOCH = datetime(1904, 1, 1, tzinfo=timezone.utc)
+
+_FILENAME_PATTERNS: list[tuple[re.Pattern[str], bool]] = [
+    (
+        re.compile(
+            r"(?P<year>[12]\d{3})(?P<month>\d{2})(?P<day>\d{2})[-_T ]?(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})"
+        ),
+        True,
+    ),
+    (
+        re.compile(
+            r"(?P<year>[12]\d{3})[-_](?P<month>\d{2})[-_](?P<day>\d{2})[-_T ](?P<hour>\d{2})[-_](?P<minute>\d{2})[-_](?P<second>\d{2})"
+        ),
+        True,
+    ),
+    (
+        re.compile(r"(?P<year>[12]\d{3})(?P<month>\d{2})(?P<day>\d{2})"),
+        False,
+    ),
+    (
+        re.compile(r"(?P<year>[12]\d{3})[-_](?P<month>\d{2})[-_](?P<day>\d{2})"),
+        False,
+    ),
+]
+
 
 def detect_media_type(path: Path) -> MediaType:
     suffix = path.suffix.lower()
@@ -193,6 +225,9 @@ def extract_metadata(path: Path) -> MediaMetadata:
         captured_at, timestamp_source = _extract_document_metadata(path)
 
     if captured_at is None:
+        captured_at, timestamp_source = _extract_timestamp_from_filename(path)
+
+    if captured_at is None:
         captured_at, timestamp_source = _filesystem_timestamp(path)
 
     return MediaMetadata(
@@ -231,6 +266,18 @@ def _extract_image_metadata(
 
 
 def _extract_video_metadata(path: Path) -> tuple[Optional[datetime], TimestampSource]:
+    captured_at, source = _extract_video_metadata_ffprobe(path)
+    if captured_at:
+        return captured_at, source
+
+    container_datetime = _extract_quicktime_creation(path)
+    if container_datetime:
+        return container_datetime, TimestampSource.CONTAINER_METADATA
+
+    return None, TimestampSource.UNKNOWN
+
+
+def _extract_video_metadata_ffprobe(path: Path) -> tuple[Optional[datetime], TimestampSource]:
     cmd = [
         "ffprobe",
         "-v",
@@ -303,6 +350,125 @@ def _extract_video_metadata(path: Path) -> tuple[Optional[datetime], TimestampSo
                     return parsed, TimestampSource.METADATA
 
     return None, TimestampSource.UNKNOWN
+
+
+def _extract_quicktime_creation(path: Path) -> Optional[datetime]:
+    try:
+        with path.open("rb") as handle:
+            return _parse_quicktime_stream(handle)
+    except (OSError, ValueError) as exc:
+        logger.debug("No se pudo leer metadata QuickTime en %s: %s", path, exc)
+        return None
+
+
+def _parse_quicktime_stream(handle: BinaryIO) -> Optional[datetime]:
+    while True:
+        header = handle.read(8)
+        if len(header) < 8:
+            return None
+        size, atom_type = struct.unpack(">I4s", header)
+        if size == 0:
+            return None
+        header_length = 8
+        if size == 1:
+            extended = handle.read(8)
+            if len(extended) < 8:
+                return None
+            size = struct.unpack(">Q", extended)[0]
+            header_length = 16
+        payload_size = size - header_length
+        if payload_size < 0:
+            return None
+        if atom_type == b"moov":
+            data = handle.read(payload_size)
+            if len(data) != payload_size:
+                return None
+            creation = _parse_quicktime_moov(data)
+            if creation:
+                return creation
+        else:
+            handle.seek(payload_size, 1)
+
+
+def _parse_quicktime_moov(data: bytes) -> Optional[datetime]:
+    offset = 0
+    length = len(data)
+    while offset + 8 <= length:
+        size = struct.unpack(">I", data[offset : offset + 4])[0]
+        atom_type = data[offset + 4 : offset + 8]
+        header_length = 8
+        if size == 1:
+            if offset + 16 > length:
+                return None
+            size = struct.unpack(">Q", data[offset + 8 : offset + 16])[0]
+            header_length = 16
+        elif size == 0:
+            size = length - offset
+        if size < header_length or offset + size > length:
+            return None
+        start = offset + header_length
+        end = offset + size
+        payload = data[start:end]
+        if atom_type == b"mvhd":
+            creation = _parse_quicktime_header_atom(payload)
+            if creation:
+                return creation
+        elif atom_type == b"trak":
+            creation = _parse_quicktime_trak(payload)
+            if creation:
+                return creation
+        offset += size
+    return None
+
+
+def _parse_quicktime_trak(data: bytes) -> Optional[datetime]:
+    offset = 0
+    length = len(data)
+    while offset + 8 <= length:
+        size = struct.unpack(">I", data[offset : offset + 4])[0]
+        atom_type = data[offset + 4 : offset + 8]
+        header_length = 8
+        if size == 1:
+            if offset + 16 > length:
+                return None
+            size = struct.unpack(">Q", data[offset + 8 : offset + 16])[0]
+            header_length = 16
+        elif size == 0:
+            size = length - offset
+        if size < header_length or offset + size > length:
+            return None
+        start = offset + header_length
+        end = offset + size
+        payload = data[start:end]
+        if atom_type == b"tkhd":
+            creation = _parse_quicktime_header_atom(payload)
+            if creation:
+                return creation
+        offset += size
+    return None
+
+
+def _parse_quicktime_header_atom(data: bytes) -> Optional[datetime]:
+    if len(data) < 8:
+        return None
+    version = data[0]
+    if version == 1:
+        if len(data) < 20:
+            return None
+        creation_value = struct.unpack(">Q", data[4:12])[0]
+    else:
+        creation_value = struct.unpack(">I", data[4:8])[0]
+    return _quicktime_epoch_to_datetime(creation_value)
+
+
+def _quicktime_epoch_to_datetime(value: int) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = QUICKTIME_EPOCH + timedelta(seconds=int(value))
+    except (OverflowError, ValueError):
+        return None
+    return dt.astimezone()
 
 
 def _extract_audio_metadata(path: Path) -> tuple[Optional[datetime], TimestampSource]:
@@ -440,6 +606,48 @@ def _extract_office_metadata(
             return parsed, TimestampSource.METADATA
 
     return None, TimestampSource.UNKNOWN
+
+
+def _extract_timestamp_from_filename(path: Path) -> tuple[Optional[datetime], TimestampSource]:
+    timestamp = _parse_timestamp_from_filename(path.stem)
+    if timestamp is None:
+        timestamp = _parse_timestamp_from_filename(path.name)
+    if timestamp is None:
+        return None, TimestampSource.UNKNOWN
+    return timestamp, TimestampSource.FILENAME
+
+
+def _parse_timestamp_from_filename(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    for pattern, includes_time in _FILENAME_PATTERNS:
+        match = pattern.search(value)
+        if not match:
+            continue
+        try:
+            year = int(match.group("year"))
+            month = int(match.group("month"))
+            day = int(match.group("day"))
+        except (KeyError, ValueError):
+            continue
+
+        hour = minute = second = 0
+        if includes_time:
+            try:
+                hour = int(match.group("hour"))
+                minute = int(match.group("minute"))
+                second = int(match.group("second"))
+            except (KeyError, ValueError, TypeError):
+                continue
+
+        try:
+            naive = datetime(year, month, day, hour, minute, second)
+        except ValueError:
+            continue
+
+        local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+        return naive.replace(tzinfo=local_tz)
+    return None
 
 
 def _filesystem_timestamp(path: Path) -> tuple[datetime, TimestampSource]:
